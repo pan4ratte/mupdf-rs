@@ -16,6 +16,8 @@ use make::Make;
 mod msbuild;
 use msbuild::Msbuild;
 
+mod folio_patches;
+
 pub type Result<T> = result::Result<T, Box<dyn Error>>;
 
 fn main() {
@@ -61,6 +63,7 @@ fn run() -> Result<()> {
 
         copy_recursive(&src_dir, build_dir.as_ref(), &[".git".as_ref()])?;
         patch_mupdf_sources(build_dir.as_ref())?;
+        folio_patches::apply(build_dir.as_ref())?;
 
         Build::new(&target).run(&target, build_dir)?;
         build_wrapper(&target).map_err(|e| format!("Unable to compile mupdf wrapper:\n  {e}"))?;
