@@ -96,7 +96,23 @@ impl Make {
         self.system_lib("jbig2dec", SystemLib::Libs, "JBIG2DEC", &["jbig2dec"])?;
         self.system_lib("jpegxr", SystemLib::Explicit, "JPEGXR", &["jpegxr"])?;
         self.system_lib("lcms2", SystemLib::Explicit, "LCMS2", &["lcms2"])?;
-        self.system_lib("libjpeg", SystemLib::Libs, "LIBJPEG", &["libjpeg"])?;
+        if let Some(include) = crate::folio_patches::libjpeg_turbo_include()? {
+            // Folio: MuPDF's Makethird builds against an outside libjpeg (SHARE_JPEG)
+            // when told to; mozjpeg-sys links it, so no library is named here.
+            let mut cflags = OsString::new();
+            for path in env::split_paths(&include) {
+                if !cflags.is_empty() {
+                    cflags.push(" ");
+                }
+                cflags.push("-I");
+                cflags.push(path);
+            }
+            self.make_bool("USE_SYSTEM_LIBJPEG", true);
+            self.make_var("SYS_LIBJPEG_CFLAGS", &cflags);
+            self.make_var("SYS_LIBJPEG_LIBS", "");
+        } else {
+            self.system_lib("libjpeg", SystemLib::Libs, "LIBJPEG", &["libjpeg"])?;
+        }
         self.system_lib("openjpeg", SystemLib::Libs, "OPENJPEG", &["libopenjp2"])?;
         self.system_lib("zlib", SystemLib::Libs, "ZLIB", &["zlib"])?;
 

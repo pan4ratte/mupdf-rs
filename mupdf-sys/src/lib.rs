@@ -6,6 +6,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+// Folio: MuPDF is built against libjpeg-turbo's decoder in place of its own libjpeg
+// (folio_patches.rs); naming the crate links its static library.
+#[cfg(feature = "libjpeg-turbo")]
+extern crate mozjpeg_sys as _;
+
 use core::ffi::{c_int, CStr};
 
 /// This function allocates a new device and returns a pointer to it if no error occured. For the

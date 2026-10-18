@@ -246,6 +246,11 @@ linker-plugin-lto = []
 
 zerocopy = ["dep:zerocopy"]
 
+# Folio: decode JPEG with libjpeg-turbo's decoder (through mozjpeg-sys, which builds it
+# statically, with its SIMD code where NASM is installed) instead of MuPDF's bundled IJG
+# libjpeg, which has none. See folio_patches.rs.
+libjpeg-turbo = ["dep:mozjpeg-sys"]
+
 [build-dependencies]
 bindgen = { version = "0.73", default-features = false, features = ["runtime"] }
 cc = "1.0.50"
@@ -254,3 +259,5 @@ regex = "1.11"
 
 [dependencies]
 zerocopy = { version = "0.8.17", features = ["derive"], optional = true }
+# Folio: arithmetic-coded JPEG, which MuPDF's own libjpeg decodes, is kept (arith_dec).
+mozjpeg-sys = { version = "=2.2.3", default-features = false, features = ["nasm_simd", "arith_dec", "parallel"], optional = true }

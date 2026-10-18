@@ -64,6 +64,9 @@ fn run() -> Result<()> {
         copy_recursive(&src_dir, build_dir.as_ref(), &[".git".as_ref()])?;
         patch_mupdf_sources(build_dir.as_ref())?;
         folio_patches::apply(build_dir.as_ref())?;
+        if target.env == "msvc" {
+            folio_patches::libjpeg_turbo_msbuild(build_dir.as_ref())?;
+        }
 
         Build::new(&target).run(&target, build_dir)?;
         build_wrapper(&target).map_err(|e| format!("Unable to compile mupdf wrapper:\n  {e}"))?;

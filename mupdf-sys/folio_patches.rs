@@ -15,6 +15,15 @@
 //!   the image is decoded in full, as before.
 //! - No public header changes: `fz_load_jpx_reduced` is declared where it is used.
 //!
+//! **Decoding JPEG with libjpeg-turbo** (the `libjpeg-turbo` feature). MuPDF bundles the
+//! Independent JPEG Group's libjpeg, which has no SIMD code: a 16-megapixel CMYK JPEG takes
+//! about 300 ms to decode, where libjpeg-turbo takes about 90. MuPDF already builds against
+//! an outside libjpeg (`SHARE_JPEG`, as Linux distributions build it with libjpeg-turbo);
+//! with the feature on, it is built that way against the libjpeg-turbo decoder that
+//! `mozjpeg-sys` compiles and links (MozJPEG changes only libjpeg-turbo's encoder), and its
+//! own libjpeg is left out. The make build is told so through `USE_SYSTEM_LIBJPEG`
+//! (make.rs); the MSBuild projects are patched here (`libjpeg_turbo_msbuild`).
+//!
 //! Each patch must match exactly once, so a MuPDF update that moves the code fails the
 //! build here instead of silently dropping the change.
 
@@ -26,7 +35,65 @@ use crate::Result;
 pub fn apply(build_dir: &Path) -> Result<()> {
     replace_in(build_dir, "source/fitz/load-jpx.c", LOAD_JPX)?;
     replace_in(build_dir, "source/fitz/image.c", IMAGE)?;
+    replace_in(build_dir, "source/fitz/filter-dct.c", FILTER_DCT)?;
     Ok(())
+}
+
+/// The folders holding libjpeg-turbo's headers (as a path list), when the `libjpeg-turbo`
+/// feature is on: `mozjpeg-sys` publishes them as the `include` of its `links = "jpeg"`.
+pub fn libjpeg_turbo_include() -> Result<Option<String>> {
+    if !cfg!(feature = "libjpeg-turbo") {
+        return Ok(None);
+    }
+    let include = std::env::var("DEP_JPEG_INCLUDE")
+        .map_err(|_| "Folio: the libjpeg-turbo feature is on, but mozjpeg-sys gave no DEP_JPEG_INCLUDE")?;
+    Ok(Some(include))
+}
+
+/// The MSBuild side of the `libjpeg-turbo` feature: libthirdparty no longer compiles
+/// MuPDF's libjpeg, and libmupdf is compiled with `SHARE_JPEG` against libjpeg-turbo's
+/// headers in place of libjpeg's.
+pub fn libjpeg_turbo_msbuild(build_dir: &Path) -> Result<()> {
+    let Some(include) = libjpeg_turbo_include()? else {
+        return Ok(());
+    };
+    let include: Vec<String> = std::env::split_paths(&include)
+        .map(|p| p.display().to_string())
+        .collect();
+
+    let path = build_dir.join("platform/win32/libthirdparty.vcxproj");
+    let source = read(&path)?;
+    let before = source.lines().count();
+    let kept: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.contains(r"..\..\thirdparty\libjpeg\"))
+        .collect();
+    if kept.len() == before {
+        Err("Folio patch for libthirdparty.vcxproj: found none of libjpeg's sources")?;
+    }
+    write(&path, &(kept.join("\r\n") + "\r\n"))?;
+
+    let path = build_dir.join("platform/win32/libmupdf.vcxproj");
+    let mut source = read(&path)?;
+    for (old, new) in [
+        (r"..\..\scripts\libjpeg;".to_owned(), format!("{};", include.join(";"))),
+        (r"..\..\thirdparty\libjpeg;".to_owned(), String::new()),
+        ("<PreprocessorDefinitions>".to_owned(), "<PreprocessorDefinitions>SHARE_JPEG;".to_owned()),
+    ] {
+        if !source.contains(&old) {
+            Err(format!("Folio patch for libmupdf.vcxproj: found no {old}"))?;
+        }
+        source = source.replace(&old, &new);
+    }
+    write(&path, &source)
+}
+
+fn read(path: &Path) -> Result<String> {
+    Ok(fs::read_to_string(path).map_err(|e| format!("Unable to read {}: {e}", path.display()))?)
+}
+
+fn write(path: &Path, source: &str) -> Result<()> {
+    Ok(fs::write(path, source).map_err(|e| format!("Unable to write {}: {e}", path.display()))?)
 }
 
 fn replace_in(build_dir: &Path, file: &str, patches: &[(&str, &str)]) -> Result<()> {
@@ -158,6 +225,20 @@ fz_load_jpx_reduced(fz_context *ctx, const unsigned char *data, size_t size, fz_
 {\n\
 \tfz_throw(ctx, FZ_ERROR_UNSUPPORTED, \"JPX support disabled\");\n\
 }\n",
+    ),
+];
+
+/// The JPEG filter hands its output on in 4 KB pieces; a row wider than that (any image
+/// over 1,024 RGB pixels across) is decoded into a row buffer and was copied out a byte at
+/// a time, 65 million times for a 16-megapixel CMYK image. Copied with memcpy instead.
+const FILTER_DCT: &[(&str, &str)] = &[
+    (
+        "\t\t\tstate->wp = state->scanline;\n\t\t}\n\n\t\twhile (state->rp < state->wp && p < ep)\n\t\t\t*p++ = *state->rp++;\n",
+        "\t\t\tstate->wp = state->scanline;\n\t\t}\n\n\t\t/* Folio: memcpy, not a byte at a time. */\n\t\tif (state->rp < state->wp && p < ep)\n\t\t{\n\t\t\tsize_t n = fz_minz(state->wp - state->rp, ep - p);\n\t\t\tmemcpy(p, state->rp, n);\n\t\t\tp += n;\n\t\t\tstate->rp += n;\n\t\t}\n",
+    ),
+    (
+        "\t\t\t\tstate->wp = state->scanline + state->stride;\n\t\t\t}\n\n\t\t\twhile (state->rp < state->wp && p < ep)\n\t\t\t\t*p++ = *state->rp++;\n",
+        "\t\t\t\tstate->wp = state->scanline + state->stride;\n\t\t\t}\n\n\t\t\t/* Folio: memcpy, not a byte at a time. */\n\t\t\tif (state->rp < state->wp && p < ep)\n\t\t\t{\n\t\t\t\tsize_t n = fz_minz(state->wp - state->rp, ep - p);\n\t\t\t\tmemcpy(p, state->rp, n);\n\t\t\t\tp += n;\n\t\t\t\tstate->rp += n;\n\t\t\t}\n",
     ),
 ];
 
