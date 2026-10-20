@@ -24,6 +24,14 @@
 //! own libjpeg is left out. The make build is told so through `USE_SYSTEM_LIBJPEG`
 //! (make.rs); the MSBuild projects are patched here (`libjpeg_turbo_msbuild`).
 //!
+//! **Text from embedded CIDFonts without a ToUnicode CMap.** A font subset with
+//! Identity-H and no `/ToUnicode` (common in Georgian, Armenian and Indic documents made
+//! by older tools) gives text extraction nothing to go by: every character comes out as
+//! U+FFFD, so it can be neither copied nor searched. MuPDF leaves this as a TODO in
+//! `pdf_load_to_unicode`; PDFium and Acrobat read the text off the font's own Unicode
+//! cmap. `load_cid_font` now does that too when nothing else gave the font a map: each CID
+//! gets the code point that the font's cmap maps to the glyph the CID is drawn with.
+//!
 //! Each patch must match exactly once, so a MuPDF update that moves the code fails the
 //! build here instead of silently dropping the change.
 
@@ -36,6 +44,7 @@ pub fn apply(build_dir: &Path) -> Result<()> {
     replace_in(build_dir, "source/fitz/load-jpx.c", LOAD_JPX)?;
     replace_in(build_dir, "source/fitz/image.c", IMAGE)?;
     replace_in(build_dir, "source/fitz/filter-dct.c", FILTER_DCT)?;
+    replace_in(build_dir, "source/pdf/pdf-font.c", PDF_FONT)?;
     Ok(())
 }
 
@@ -260,5 +269,105 @@ static fz_pixmap *\ncompressed_image_get_pixmap(fz_context *ctx, fz_image *image
 \t\t\tif (l2factor)\n\
 \t\t\t\t*l2factor -= reduce;\n\
 \t\t}\n",
+    ),
+];
+
+const PDF_FONT: &[(&str, &str)] = &[
+    (
+        "static pdf_font_desc *\n\
+load_cid_font(fz_context *ctx, pdf_document *doc, pdf_obj *dict, pdf_obj *encoding, pdf_obj *to_unicode, pdf_obj *fftype)\n\
+{",
+        "/* Folio: a ToUnicode CMap for an embedded CIDFont that has none (and none from its\n\
+\x20* character collection), read off the font's own Unicode cmap, as other readers do.\n\
+\x20* Without it text extraction has nothing to go by and every character comes out as\n\
+\x20* U+FFFD (fonts subset with Identity-H and no ToUnicode: Georgian, Armenian and Indic\n\
+\x20* documents from older tools). Each CID gets the code point the font maps to the glyph\n\
+\x20* it is drawn with (pdf_font_cid_to_gid, as rendering does); where several code points\n\
+\x20* map to one glyph, the lowest wins, a private use one only if there is no other. The\n\
+\x20* charmap the face had is selected again afterwards. */\n\
+static void\n\
+pdf_synthesize_cid_to_unicode(fz_context *ctx, pdf_font_desc *fontdesc)\n\
+{\n\
+\tFT_Face face = fontdesc->font->ft_face;\n\
+\tFT_CharMap old;\n\
+\tFT_ULong ucs;\n\
+\tFT_UInt gid;\n\
+\tint *ucs_from_gid = NULL;\n\
+\tpdf_cmap *cmap = NULL;\n\
+\tint n, cid, glyph, had, pua, count = 0;\n\
+\n\
+\tif (!face || face->num_glyphs <= 0)\n\
+\t\treturn;\n\
+\n\
+\tfz_var(ucs_from_gid);\n\
+\tfz_var(cmap);\n\
+\n\
+\tfz_try(ctx)\n\
+\t{\n\
+\t\tucs_from_gid = fz_calloc(ctx, face->num_glyphs, sizeof *ucs_from_gid);\n\
+\n\
+\t\tfz_ft_lock(ctx);\n\
+\t\told = face->charmap;\n\
+\t\tif (FT_Select_Charmap(face, FT_ENCODING_UNICODE) == 0)\n\
+\t\t{\n\
+\t\t\tfor (ucs = FT_Get_First_Char(face, &gid); gid != 0; ucs = FT_Get_Next_Char(face, ucs, &gid))\n\
+\t\t\t{\n\
+\t\t\t\tif (gid >= (FT_UInt)face->num_glyphs || ucs < 0x20 || (ucs >= 0x7F && ucs < 0xA0) || ucs > 0x10FFFF)\n\
+\t\t\t\t\tcontinue;\n\
+\t\t\t\tpua = (ucs >= 0xE000 && ucs <= 0xF8FF) || ucs >= 0xF0000;\n\
+\t\t\t\thad = ucs_from_gid[gid];\n\
+\t\t\t\tif (had == 0 || (!pua && ((had >= 0xE000 && had <= 0xF8FF) || had >= 0xF0000)))\n\
+\t\t\t\t\tucs_from_gid[gid] = (int)ucs;\n\
+\t\t\t}\n\
+\t\t\tif (old)\n\
+\t\t\t\tFT_Set_Charmap(face, old);\n\
+\t\t}\n\
+\t\tfz_ft_unlock(ctx);\n\
+\n\
+\t\tn = fontdesc->cid_to_gid ? (int)fontdesc->cid_to_gid_len : face->num_glyphs;\n\
+\t\tif (n > 0x10000)\n\
+\t\t\tn = 0x10000;\n\
+\t\tcmap = pdf_new_cmap(ctx);\n\
+\t\tpdf_add_codespace(ctx, cmap, 0, 0xFFFF, 2);\n\
+\t\tfor (cid = 0; cid < n; cid++)\n\
+\t\t{\n\
+\t\t\tglyph = pdf_font_cid_to_gid(ctx, fontdesc, cid);\n\
+\t\t\tif (glyph > 0 && glyph < face->num_glyphs && ucs_from_gid[glyph])\n\
+\t\t\t{\n\
+\t\t\t\tpdf_map_range_to_range(ctx, cmap, cid, cid, ucs_from_gid[glyph]);\n\
+\t\t\t\tcount++;\n\
+\t\t\t}\n\
+\t\t}\n\
+\t\tif (count > 0)\n\
+\t\t{\n\
+\t\t\tpdf_sort_cmap(ctx, cmap);\n\
+\t\t\tfontdesc->to_unicode = cmap;\n\
+\t\t\tcmap = NULL;\n\
+\t\t\tfontdesc->size += pdf_cmap_size(ctx, fontdesc->to_unicode);\n\
+\t\t}\n\
+\t}\n\
+\tfz_always(ctx)\n\
+\t{\n\
+\t\tfz_free(ctx, ucs_from_gid);\n\
+\t\tif (cmap)\n\
+\t\t\tpdf_drop_cmap(ctx, cmap);\n\
+\t}\n\
+\tfz_catch(ctx)\n\
+\t{\n\
+\t\tfz_rethrow_if(ctx, FZ_ERROR_SYSTEM);\n\
+\t\tfz_report_error(ctx);\n\
+\t\tfz_warn(ctx, \"cannot read a ToUnicode map from the font's cmap\");\n\
+\t}\n\
+}\n\
+\n\
+static pdf_font_desc *\n\
+load_cid_font(fz_context *ctx, pdf_document *doc, pdf_obj *dict, pdf_obj *encoding, pdf_obj *to_unicode, pdf_obj *fftype)\n\
+{",
+    ),
+    (
+        "\t\tpdf_load_to_unicode(ctx, doc, fontdesc, NULL, collection, to_unicode);\n",
+        "\t\tpdf_load_to_unicode(ctx, doc, fontdesc, NULL, collection, to_unicode);\n\
+\t\tif (!fontdesc->to_unicode && !fontdesc->font->flags.ft_substitute)\n\
+\t\t\tpdf_synthesize_cid_to_unicode(ctx, fontdesc);\n",
     ),
 ];
