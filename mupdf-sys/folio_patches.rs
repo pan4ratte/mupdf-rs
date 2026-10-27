@@ -32,6 +32,14 @@
 //! cmap. `load_cid_font` now does that too when nothing else gave the font a map: each CID
 //! gets the code point that the font's cmap maps to the glyph the CID is drawn with.
 //!
+//! **Text from symbolic Type 1 fonts whose glyph names mean nothing.** Fonts such as
+//! 3B2's Advent fonts name their glyphs after their codes (`/C65`, `/C101`) and have no
+//! ToUnicode, so every character comes out as U+FFFD. MuPDF means to read such a font's
+//! codes as Adobe's standard encoding, but its test for a name it does not know asks
+//! `fz_unicode_from_glyph_name` for 0, and that function returns U+FFFD instead, so the
+//! fallback never ran (upstream's master too). The test now asks for U+FFFD. Only the
+//! text changes: the glyphs were chosen before.
+//!
 //! Each patch must match exactly once, so a MuPDF update that moves the code fails the
 //! build here instead of silently dropping the change.
 
@@ -369,5 +377,9 @@ load_cid_font(fz_context *ctx, pdf_document *doc, pdf_obj *dict, pdf_obj *encodi
         "\t\tpdf_load_to_unicode(ctx, doc, fontdesc, NULL, collection, to_unicode);\n\
 \t\tif (!fontdesc->to_unicode && !fontdesc->font->flags.ft_substitute)\n\
 \t\t\tpdf_synthesize_cid_to_unicode(ctx, fontdesc);\n",
+    ),
+    (
+        "\t\t\t\tif (etable[i] && estrings[i] && !fz_unicode_from_glyph_name(estrings[i]))\n",
+        "\t\t\t\tif (etable[i] && estrings[i] && fz_unicode_from_glyph_name(estrings[i]) == FZ_REPLACEMENT_CHARACTER) /* Folio: it never returns 0 */\n",
     ),
 ];
