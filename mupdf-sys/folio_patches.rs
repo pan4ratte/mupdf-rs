@@ -40,6 +40,12 @@
 //! fallback never ran (upstream's master too). The test now asks for U+FFFD. Only the
 //! text changes: the glyphs were chosen before.
 //!
+//! **JBIG2 images decoded against globals of their own.** Images that share a
+//! `/JBIG2Globals` stream were all decoded against one jbig2dec context, kept in the
+//! store, whose glyph reference counts are not thread safe: drawing such pages on several
+//! threads at once corrupted the heap. Each decode now reads the globals into a context of
+//! its own (Lectrix ADR 0036).
+//!
 //! Each patch must match exactly once, so a MuPDF update that moves the code fails the
 //! build here instead of silently dropping the change.
 
@@ -52,6 +58,7 @@ pub fn apply(build_dir: &Path) -> Result<()> {
     replace_in(build_dir, "source/fitz/load-jpx.c", LOAD_JPX)?;
     replace_in(build_dir, "source/fitz/image.c", IMAGE)?;
     replace_in(build_dir, "source/fitz/filter-dct.c", FILTER_DCT)?;
+    replace_in(build_dir, "source/fitz/filter-jbig2.c", FILTER_JBIG2)?;
     replace_in(build_dir, "source/pdf/pdf-font.c", PDF_FONT)?;
     Ok(())
 }
@@ -256,6 +263,55 @@ const FILTER_DCT: &[(&str, &str)] = &[
     (
         "\t\t\t\tstate->wp = state->scanline + state->stride;\n\t\t\t}\n\n\t\t\twhile (state->rp < state->wp && p < ep)\n\t\t\t\t*p++ = *state->rp++;\n",
         "\t\t\t\tstate->wp = state->scanline + state->stride;\n\t\t\t}\n\n\t\t\t/* Folio: memcpy, not a byte at a time. */\n\t\t\tif (state->rp < state->wp && p < ep)\n\t\t\t{\n\t\t\t\tsize_t n = fz_minz(state->wp - state->rp, ep - p);\n\t\t\t\tmemcpy(p, state->rp, n);\n\t\t\t\tp += n;\n\t\t\t\tstate->rp += n;\n\t\t\t}\n",
+    ),
+];
+
+/// JBIG2 images that share a `/JBIG2Globals` stream (scans made by PDFBeads, Adobe's
+/// Paper Capture and others: one symbol dictionary for hundreds of pages) were decoded
+/// against one jbig2dec context, loaded once and kept in the store. Decoding a page takes
+/// and drops references on that dictionary's glyphs, and jbig2dec counts them with a plain
+/// `refcount++`, so two threads drawing such pages lose counts, free glyphs the dictionary
+/// still holds, and corrupt the heap. Each decode now reads the globals into a context of
+/// its own, from the bytes the shared one keeps (`globals->data`).
+const FILTER_JBIG2: &[(&str, &str)] = &[
+    (
+        "\tfz_jbig2_globals *gctx;\n\tJbig2Image *page;\n",
+        "\tfz_jbig2_globals *gctx;\n\tJbig2GlobalCtx *own_gctx; /* Folio: this decode's own copy of the globals */\n\tJbig2Image *page;\n",
+    ),
+    (
+        "\tfz_drop_jbig2_globals(ctx, state->gctx);\n\tjbig2_ctx_free(state->ctx);\n",
+        "\tfz_drop_jbig2_globals(ctx, state->gctx);\n\tjbig2_ctx_free(state->ctx);\n\tif (state->own_gctx)\n\t\tjbig2_global_ctx_free(state->own_gctx);\n",
+    ),
+    (
+        "\tstate->ctx = jbig2_ctx_new((Jbig2Allocator *) &state->alloc, options, globals ? globals->gctx : NULL, error_callback, ctx);\n\
+\tif (state->ctx == NULL)\n\
+\t{\n\
+\t\tfz_drop_jbig2_globals(ctx, state->gctx);\n",
+        "\t/* Folio: decode against a copy of the globals of this decode's own, never the shared\n\
+\t * one: jbig2dec's reference counts on its glyphs are not thread safe. */\n\
+\tif (globals && globals->data && globals->data->len > 0)\n\
+\t{\n\
+\t\tJbig2Ctx *gjctx = jbig2_ctx_new((Jbig2Allocator *) &state->alloc, JBIG2_OPTIONS_EMBEDDED, NULL, error_callback, ctx);\n\
+\t\tif (gjctx && jbig2_data_in(gjctx, globals->data->data, globals->data->len) < 0)\n\
+\t\t{\n\
+\t\t\tjbig2_global_ctx_free(jbig2_make_global_ctx(gjctx));\n\
+\t\t\tgjctx = NULL;\n\
+\t\t}\n\
+\t\tif (!gjctx)\n\
+\t\t{\n\
+\t\t\tfz_drop_jbig2_globals(ctx, state->gctx);\n\
+\t\t\tfz_free(ctx, state);\n\
+\t\t\tfz_throw(ctx, FZ_ERROR_LIBRARY, \"cannot decode jbig2 globals\");\n\
+\t\t}\n\
+\t\tstate->own_gctx = jbig2_make_global_ctx(gjctx);\n\
+\t}\n\
+\n\
+\tstate->ctx = jbig2_ctx_new((Jbig2Allocator *) &state->alloc, options, state->own_gctx, error_callback, ctx);\n\
+\tif (state->ctx == NULL)\n\
+\t{\n\
+\t\tif (state->own_gctx)\n\
+\t\t\tjbig2_global_ctx_free(state->own_gctx);\n\
+\t\tfz_drop_jbig2_globals(ctx, state->gctx);\n",
     ),
 ];
 
